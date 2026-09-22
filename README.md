@@ -15,26 +15,6 @@ Each agent solves **only its own local CSP**. Coordination happens entirely thro
 
 Patients are deliberately **not** agents — they have no sensors or actions of their own. They're data a requesting agent (ER or Clinic) advocates for during negotiation, mirroring how real hospital departments actually operate.
 
-## Project Structure
-
-​```
-hospital_mas/
-├── models.py            Patient (data), Message (one negotiation event)
-├── csp_solvers.py        SurgeryScheduler, ICUCapacity, ClinicScheduler (OR-Tools CP-SAT)
-├── er_agent.py             ERAgent
-├── surgery_agent.py         SurgeryAgent
-├── icu_agent.py               ICUAgent
-├── clinic_agent.py              ClinicAgent
-├── negotiation.py                 ContractNetProtocol, NegotiationLog
-├── simulate.py                      baseline_scenario(), stress_test_scenario()
-├── visualize.py                       Swimlane timeline chart
-├── main.py                              Entry point: runs both scenarios, saves output/
-├── app.py                                 Interactive Streamlit explorer (secondary demo tool)
-├── tests/                                   Standalone sanity checks per component
-└── PROJECT_NOTES.md                           Rubric mapping
-​```
-
-
 ## Setup
 
 ```bash
