@@ -85,4 +85,3 @@ python tests/test_visualize.py
 - **No deterministic tie-breaker** for patients with identical acuity — ordering among equal-priority patients currently depends on CP-SAT solver internals rather than an explicit rule (e.g., earliest-arrival-wins).
 - **Centralized solving would find a more globally optimal schedule** — this is a deliberate tradeoff, not an oversight: the distributed design trades some optimality for department autonomy and no single point of failure, which mirrors how real hospital departments actually operate.
 
-See `PROJECT_NOTES.md` for the full rubric mapping and prepared Q&A answers.
