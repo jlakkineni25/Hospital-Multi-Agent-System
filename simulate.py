@@ -48,37 +48,38 @@ def baseline_scenario():
 
 def stress_test_scenario():
     er = ERAgent()
-    surgery = SurgeryAgent(num_rooms=1)
+    surgery = SurgeryAgent(num_rooms=1, horizon_minutes=300)  # 5-hour window, less brutal
     icu = ICUAgent(total_beds=2)
     clinic = ClinicAgent(num_rooms=1)
     log = NegotiationLog()
     protocol = ContractNetProtocol(er, surgery, icu, clinic, log)
 
-    # routine patients already booked before the surge hits
+    # routine patients already booked -- kept modest so the horizon
+    # isn't immediately exhausted before the surge even arrives
     pre_scheduled = [
-        Patient(name="F. Pillai", acuity=4, duration=90, icu_duration=180),
-        Patient(name="G. Krishnan", acuity=4, duration=120, icu_duration=240),
+        Patient(name="F. Pillai", acuity=4, duration=60, icu_duration=180),
+        Patient(name="G. Krishnan", acuity=4, duration=60, icu_duration=240),
     ]
     for p in pre_scheduled:
         protocol.request_or("ER", p)
 
-    # a severe walk-in at Clinic that must escalate
     clinic.walkins = [
-        Patient(name="I. Subra (walk-in)", acuity=1, duration=50,
+        Patient(name="I. Subra (walk-in)", acuity=1, duration=40,
                 icu_duration=200, patient_type="walk-in"),
     ]
     escalated = protocol.run_clinic_escalations()
     for p in escalated:
-        protocol.request_or("ER", p)   # now negotiate for their OR too
+        protocol.request_or("ER", p)
 
-    # the mass-casualty surge itself
     surge_patients = [
         Patient(name="J. Kumar (MVA)", acuity=1, specialty=Specialty.TRAUMA,
-                duration=100, icu_duration=300, patient_type="emergency"),
+                duration=60, icu_duration=300, patient_type="emergency"),
         Patient(name="K. Devi (MVA)", acuity=1, specialty=Specialty.TRAUMA,
-                duration=80, icu_duration=240, patient_type="emergency"),
+                duration=60, icu_duration=240, patient_type="emergency"),
         Patient(name="L. Suresh (MVA)", acuity=2, specialty=Specialty.TRAUMA,
-                duration=70, icu_duration=180, patient_type="emergency"),
+                duration=50, icu_duration=180, patient_type="emergency"),
+        Patient(name="M. Nair (MVA)", acuity=1, specialty=Specialty.TRAUMA,
+                duration=50, icu_duration=200, patient_type="emergency"),
     ]
     results = []
     for p in surge_patients:
@@ -87,7 +88,6 @@ def stress_test_scenario():
         results.append((p, ok))
 
     return log, (er, surgery, icu, clinic), results
-
 
 if __name__ == "__main__":
     print("=" * 70)

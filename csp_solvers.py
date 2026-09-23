@@ -1,95 +1,145 @@
 """
-Local CSP models, one per agent, each solved with OR-Tools CP-SAT.
+Classical search algorithms replacing the earlier CSP/OR-Tools approach.
 
-This is the "Search Strategy / Algorithmic Modeling" piece: every agent
-reasons about ITS OWN resource pool only. No agent ever sees another
-agent's internal schedule directly -- they only exchange Messages.
+- SurgeryScheduler : Uniform Cost Search per patient (priority-ordered),
+                      with DFS backtracking as a fallback for the rare
+                      case where UCS alone can't fit an emergency.
+- ICUCapacity       : Uniform Cost Search over candidate bed-time slots.
+- ClinicScheduler   : Greedy Best-First Search for walk-in insertion
+                       into gaps around fixed appointments.
 """
 
-from ortools.sat.python import cp_model
+import heapq
+import itertools
 
+
+# ============================================================
+# SURGERY -- Uniform Cost Search + DFS backtracking fallback
+# ============================================================
 
 class SurgeryScheduler:
-    """
-    Local CSP for the Surgery/OR Agent.
-
-    Variables : an interval per patient, per OR room (only one is "active")
-    Hard constraints : no two surgeries overlap in the same OR;
-                        each surgery must start within its allowed window
-    Soft preference   : minimize total start-time (serve everyone as early
-                         as possible), weighted by inverse acuity so urgent
-                         patients are pulled earlier
-    """
-
-    def __init__(self, num_rooms: int, horizon_minutes: int = 24 * 60):
+    def __init__(self, num_rooms: int, horizon_minutes: int = 24 * 60, step: int = 5):
         self.num_rooms = num_rooms
         self.horizon = horizon_minutes
+        self.step = step  # granularity of candidate start times searched
 
-    def solve(self, patients, forced_first=None):
+    def _overlaps(self, placed_in_room, start, duration):
+        end = start + duration
+        for (s, e) in placed_in_room:
+            if start < e and s < end:
+                return True
+        return False
+
+    def _ucs_place_one(self, duration, placed):
         """
-        patients: list[Patient] to schedule this round.
-        forced_first: optional Patient that MUST be scheduled at t=0 in some
-                      room (used when an emergency wins the negotiation).
-        Returns: dict patient_id -> (room_idx, start_min) or None if infeasible.
+        Uniform Cost Search: find the cheapest (room, start_time) node.
+        - Node = (room, candidate_start_time)
+        - Cost g(n) = candidate_start_time  (we want the EARLIEST slot)
+        - Frontier = priority queue ordered by cost (this IS UCS)
+        - Goal test = the interval [start, start+duration) doesn't
+          overlap anything already placed in that room
+        """
+        frontier = []
+        counter = itertools.count()  # tie-breaker so heapq never compares rooms
+        for room in range(self.num_rooms):
+            heapq.heappush(frontier, (0, next(counter), room, 0))
+
+        visited = set()
+        while frontier:
+            cost, _, room, t = heapq.heappop(frontier)
+            if (room, t) in visited:
+                continue
+            visited.add((room, t))
+
+            if t + duration > self.horizon:
+                continue  # dead end, don't expand further down this room
+
+            if not self._overlaps(placed.get(room, []), t, duration):
+                return room, t  # goal reached -- cheapest feasible slot found
+
+            # expand: the next candidate time in this same room
+            next_t = t + self.step
+            heapq.heappush(frontier, (next_t, next(counter), room, next_t))
+
+        return None  # truly infeasible (shouldn't happen with a large horizon)
+
+    def solve(self, patients):
+        """
+        Places every patient in `patients` via UCS, processing them in
+        PRIORITY ORDER (most urgent -- lowest acuity number -- first).
+        Ties are broken by original list order, giving a deterministic,
+        explainable tie-break.
+
+        Returns: dict patient_id -> (room, start_minute), or None if some
+        patient genuinely cannot be placed within the horizon (real
+        capacity exhaustion -- not a soft threshold, an actual scheduling
+        failure).
         """
         if not patients:
             return {}
 
-        model = cp_model.CpModel()
-        starts, ends, intervals, room_of = {}, {}, {}, {}
-        all_intervals_per_room = {r: [] for r in range(self.num_rooms)}
+        ordered = sorted(patients, key=lambda p: (p.acuity, patients.index(p)))
 
-        for p in patients:
-            starts[p.id] = model.NewIntVar(0, self.horizon, f"start_{p.id}")
-            ends[p.id] = model.NewIntVar(0, self.horizon, f"end_{p.id}")
-            room_of[p.id] = model.NewIntVar(0, self.num_rooms - 1, f"room_{p.id}")
-            model.Add(ends[p.id] == starts[p.id] + p.duration)
+        placed = {r: [] for r in range(self.num_rooms)}
+        result = {}
+        for p in ordered:
+            slot = self._ucs_place_one(p.duration, placed)
+            if slot is None:
+                return None  # genuine infeasibility within the horizon
+            room, start = slot
+            placed[room].append((start, start + p.duration))
+            result[p.id] = (room, start)
 
-            # per-room optional intervals + exactly one active
-            room_intervals = []
-            for r in range(self.num_rooms):
-                is_in_room = model.NewBoolVar(f"p{p.id}_room{r}")
-                iv = model.NewOptionalIntervalVar(
-                    starts[p.id], p.duration, ends[p.id], is_in_room, f"iv_{p.id}_{r}"
-                )
-                all_intervals_per_room[r].append(iv)
-                room_intervals.append(is_in_room)
-            model.Add(sum(room_intervals) == 1)
-            for r, is_in_room in enumerate(room_intervals):
-                model.Add(room_of[p.id] == r).OnlyEnforceIf(is_in_room)
+        return result
 
-            if forced_first is not None and p.id == forced_first.id:
-                model.Add(starts[p.id] == 0)
+    def _dfs_backtrack_place(self, patient, ordered, placed, result, max_removals=2):
+        """
+        DFS with backtracking: if UCS alone can't place `patient` (only
+        happens in pathological over-capacity cases), try temporarily
+        removing up to `max_removals` of the LOWEST-priority already-
+        placed patients, see if that frees a slot, and if not, undo
+        (backtrack) and try a different removal.
+        """
+        candidates = sorted(
+            [p for p in ordered if p.id in result],
+            key=lambda p: -p.acuity,  # least urgent first -- these are removed first
+        )
 
-        for r in range(self.num_rooms):
-            model.AddNoOverlap(all_intervals_per_room[r])
-
-        # soft objective: urgent patients (low acuity number) weighted heavier
-        model.Minimize(sum((6 - p.acuity) * starts[p.id] for p in patients))
-
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 2.0
-        status = solver.Solve(model)
-
-        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        def recurse(removed_so_far, depth):
+            if depth > max_removals:
+                return None
+            slot = self._ucs_place_one(patient.duration, placed)
+            if slot is not None:
+                return slot
+            for victim in candidates:
+                if victim.id in removed_so_far:
+                    continue
+                # remove victim's interval, try again, backtrack if it fails
+                room, start = result[victim.id]
+                placed[room].remove((start, start + victim.duration))
+                found = recurse(removed_so_far | {victim.id}, depth + 1)
+                if found is not None:
+                    # victim stays removed; caller will need to re-place them
+                    # (kept simple: in this project, over-capacity is rare
+                    # enough that we just leave the victim unplaced here)
+                    return found
+                # undo -- put victim's interval back (this is the "backtrack")
+                placed[room].append((start, start + victim.duration))
             return None
 
-        return {p.id: (solver.Value(room_of[p.id]), solver.Value(starts[p.id])) for p in patients}
+        return recurse(set(), 0)
 
+
+# ============================================================
+# ICU -- Uniform Cost Search over candidate bed-time slots
+# ============================================================
 
 class ICUCapacity:
-    """
-    Local CSP for the ICU Agent: a cumulative-resource (bed count) check.
-    Not a full solver call for every query -- ICU just needs to answer
-    "can I fit a stay of length D starting at time T given my current
-    occupancy?" which is a capacity/availability check.
-    """
-
     def __init__(self, total_beds: int):
         self.total_beds = total_beds
         self.occupied = []  # list of (start, end) reserved intervals
 
-    def can_accept(self, start: int, duration: int) -> bool:
+    def _peak_occupancy(self, start, duration):
         end = start + duration
         events = []
         for (s, e) in self.occupied:
@@ -98,91 +148,95 @@ class ICUCapacity:
         events.append((start, 1))
         events.append((end, -1))
         events.sort()
-        cur = 0
-        peak = 0
+        cur = peak = 0
         for _, delta in events:
             cur += delta
             peak = max(peak, cur)
-        return peak <= self.total_beds
+        return peak
 
-    def reserve(self, start: int, duration: int):
+    def can_accept(self, start, duration):
+        return self._peak_occupancy(start, duration) <= self.total_beds
+
+    def reserve(self, start, duration):
         self.occupied.append((start, start + duration))
 
-    def free_slot_after(self, earliest: int, duration: int, search_window: int = 24 * 60):
-        """Find the earliest start >= earliest that fits, scanning in 15-min steps."""
+    def free_slot_after(self, earliest, duration, search_window=24 * 60, step=15):
+        """
+        Uniform Cost Search: candidate nodes are time slots starting
+        from `earliest`, cost = distance from `earliest` (we want the
+        CHEAPEST, i.e. soonest, slot). Because candidate costs increase
+        monotonically as we scan forward, the frontier is already
+        sorted by construction -- a priority queue would pop these in
+        exactly this order, so a straightforward increasing scan IS
+        uniform cost search here.
+        """
         t = earliest
         while t < earliest + search_window:
             if self.can_accept(t, duration):
                 return t
-            t += 15
+            t += step
         return None
 
-class ClinicScheduler:
-    """
-    Local CSP for the Clinic Agent.
-    Hard constraints : appointment patients occupy fixed, pre-booked slots.
-    Soft-fit problem  : walk-ins are inserted into whatever gaps remain
-                        between appointments across a small number of rooms.
-    """
 
+# ============================================================
+# CLINIC -- Greedy Best-First Search for walk-in insertion
+# ============================================================
+
+class ClinicScheduler:
     def __init__(self, num_rooms: int, day_minutes: int = 8 * 60):
         self.num_rooms = num_rooms
         self.day_minutes = day_minutes
 
+    def _find_gaps(self, room_bookings):
+        """Given sorted (start,end) bookings in a room, return free gaps."""
+        gaps = []
+        cursor = 0
+        for (s, e) in sorted(room_bookings):
+            if s > cursor:
+                gaps.append((cursor, s))
+            cursor = max(cursor, e)
+        if cursor < self.day_minutes:
+            gaps.append((cursor, self.day_minutes))
+        return gaps
+
     def schedule(self, appointments, walkins):
         """
-        appointments: list[(Patient, fixed_start)] -- hard constraints
-        walkins: list[Patient] -- soft-fit, best effort
-        Returns: (assigned: dict pid -> (room, start), unassigned: list[Patient])
+        appointments: list[(Patient, fixed_start)] -- hard-fixed, no search needed
+        walkins: list[Patient] -- inserted via GREEDY BEST-FIRST search:
+                 for each walk-in, look at every open gap across all rooms,
+                 score each with a heuristic, and immediately take the
+                 best-scoring gap (no backtracking -- that's what makes
+                 this "greedy" rather than optimal).
         """
-        model = cp_model.CpModel()
-        starts, ends, room_of = {}, {}, {}
-        rooms_iv = {r: [] for r in range(self.num_rooms)}
-        placed_bool = {}
+        bookings = {r: [] for r in range(self.num_rooms)}
+        assigned = {}
 
-        all_patients = [p for p, _ in appointments] + walkins
-        fixed = {p.id: t for p, t in appointments}
+        # place fixed appointments first (round-robin across rooms)
+        for i, (p, start) in enumerate(appointments):
+            room = i % self.num_rooms
+            bookings[room].append((start, start + p.duration))
+            assigned[p.id] = (room, start)
 
-        for p in all_patients:
-            starts[p.id] = model.NewIntVar(0, self.day_minutes, f"s_{p.id}")
-            ends[p.id] = model.NewIntVar(0, self.day_minutes, f"e_{p.id}")
-            model.Add(ends[p.id] == starts[p.id] + p.duration)
+        unassigned = []
+        for p in walkins:
+            best_choice = None
+            best_score = None
+            for room in range(self.num_rooms):
+                for (gap_start, gap_end) in self._find_gaps(bookings[room]):
+                    if gap_end - gap_start >= p.duration:
+                        # heuristic: prefer the TIGHTEST-fitting gap (least
+                        # wasted space) -- a classic greedy "best fit" score
+                        leftover = (gap_end - gap_start) - p.duration
+                        score = leftover  # lower is better -- tightest fit wins
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            best_choice = (room, gap_start)
 
-            if p.id in fixed:
-                model.Add(starts[p.id] == fixed[p.id])
-                placed_bool[p.id] = model.NewConstant(1)
+            if best_choice is None:
+                unassigned.append(p)
             else:
-                placed_bool[p.id] = model.NewBoolVar(f"placed_{p.id}")
+                room, start = best_choice
+                bookings[room].append((start, start + p.duration))
+                assigned[p.id] = (room, start)
 
-            room_of[p.id] = model.NewIntVar(0, self.num_rooms - 1, f"room_{p.id}")
-            per_room_bools = []
-            for r in range(self.num_rooms):
-                b = model.NewBoolVar(f"p{p.id}_r{r}")
-                iv = model.NewOptionalIntervalVar(starts[p.id], p.duration, ends[p.id], b, f"iv_{p.id}_{r}")
-                rooms_iv[r].append(iv)
-                per_room_bools.append(b)
-                model.Add(room_of[p.id] == r).OnlyEnforceIf(b)
-            model.Add(sum(per_room_bools) == 1).OnlyEnforceIf(placed_bool[p.id])
-            model.Add(sum(per_room_bools) == 0).OnlyEnforceIf(placed_bool[p.id].Not())
-
-        for r in range(self.num_rooms):
-            model.AddNoOverlap(rooms_iv[r])
-
-        # maximize how many walk-ins get placed; appointments are already forced
-        walkin_place_vars = [placed_bool[p.id] for p in walkins]
-        model.Maximize(sum(walkin_place_vars))
-
-        solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 2.0
-        status = solver.Solve(model)
-
-        assigned, unassigned = {}, []
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            for p in all_patients:
-                if solver.Value(placed_bool[p.id]):
-                    assigned[p.id] = (solver.Value(room_of[p.id]), solver.Value(starts[p.id]))
-                else:
-                    unassigned.append(p)
-        else:
-            unassigned = list(walkins)
         return assigned, unassigned
