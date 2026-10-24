@@ -1,5 +1,5 @@
 """
-Classical search algorithms replacing the earlier CSP/OR-Tools approach.
+Classical search algorithms 
 
 - SurgeryScheduler : Uniform Cost Search per patient (priority-ordered),
                       with DFS backtracking as a fallback for the rare
